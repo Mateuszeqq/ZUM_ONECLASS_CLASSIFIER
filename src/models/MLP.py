@@ -1,5 +1,6 @@
 from torch import nn
 from src.constants import HIDDEN_LAYERS_SIZE
+import torch
 
 
 class Perceptron(nn.Module):
