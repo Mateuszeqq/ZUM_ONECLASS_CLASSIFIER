@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import copy
+import xgboost as xgb
 from src.models.MLP import Perceptron
 from src.constants import EVAL_THRESHOLD
 from sklearn.metrics import accuracy_score
@@ -21,7 +22,7 @@ class OneClassClassifier:
 
         if model_type == "nn":
             self.models = [Perceptron(self.input_dim) for _ in range(n_of_splits)]
-        elif model_type == "rf":
+        elif model_type == "rf" or model_type == 'xgb':
             self.models = []
         else:
             raise("Invalid model param!")
@@ -44,7 +45,7 @@ class OneClassClassifier:
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         return dataloader
     
-    def prepare_data_rf(self, idx):
+    def prepare_data_ensemble(self, idx):
         subsets = copy.deepcopy(self.subsets)
         for i, subset in enumerate(subsets):
             if i == idx:
@@ -77,12 +78,27 @@ class OneClassClassifier:
 
         if self.model_type == "rf":
             for idx in range(self.n_of_splits):
-                X, y = self.prepare_data_rf(idx)
+                X, y = self.prepare_data_ensemble(idx)
                 model = RandomForestClassifier(max_depth=4, random_state=0)
                 model.fit(X, y)
                 self.models.append(model)
                 if verbose:
                     print(f"Model {idx+1} is ready (RandomForest)")
+
+                model_score = self.evaluate(model, X_eval, y_eval)
+                self.models_eval_score.append(model_score)
+        
+        if self.model_type == "xgb":
+            for idx in range(self.n_of_splits):
+                X, y = self.prepare_data_ensemble(idx)
+                params = {
+                    'objective': 'binary:logistic',
+                }
+                model = xgb.XGBClassifier(**params)
+                model.fit(X, y)
+                self.models.append(model)
+                if verbose:
+                    print(f"Model {idx+1} is ready (XGBoost)")
 
                 model_score = self.evaluate(model, X_eval, y_eval)
                 self.models_eval_score.append(model_score)
@@ -105,7 +121,7 @@ class OneClassClassifier:
                 preds = (output > EVAL_THRESHOLD).int()
                 all_preds.extend(preds)
 
-        elif self.model_type == 'rf':
+        elif self.model_type == 'rf' or self.model_type == 'xgb':
             all_preds = model.predict(X_eval.values)
 
         return accuracy_score(y_eval.values, all_preds)
@@ -134,21 +150,24 @@ class OneClassClassifier:
         top_models = self.get_top_models(best_models_fraction)
 
         output_preds = []
+        output_probs = []
         for sample in input_samples:
             if self.model_type == 'nn':
                 sample = torch.Tensor(sample).reshape(1, -1)
                 predictions = [model.predict_proba(sample) for model in top_models]
                 average_prediction = torch.mean(torch.stack(predictions), dim=0)
                 predicted_class = (average_prediction > threshold).int().item()
-            elif self.model_type == 'rf':
+                output_probs.append(1 - average_prediction.item())
+            elif self.model_type == 'rf' or self.model_type == 'xgb':
                 sample = sample.reshape(1, -1)
                 predictions = [model.predict_proba(sample) for model in top_models]
                 average_prediction = np.mean(predictions, axis=0)[0]
                 predicted_class = 1 if average_prediction[1] >= threshold else 0
+                output_probs.append(average_prediction[1])
             
             output_preds.append(predicted_class)
         # Return avg_probability, predicted_class based on threshold
-        return output_preds
+        return output_preds, output_probs
     
     def full_predict(self, input_samples, threshold=0.5):
         if self.model_type == 'nn':
@@ -161,7 +180,7 @@ class OneClassClassifier:
                 sample = torch.Tensor(sample).reshape(1, -1)
                 predictions = [model.predict_proba(sample) for model in self.models]
                 average_prediction = torch.mean(torch.stack(predictions), dim=0)
-            elif self.model_type == 'rf':
+            elif self.model_type == 'rf' or self.model_type == 'xgb':
                 sample = sample.reshape(1, -1)
                 predictions = [model.predict_proba(sample) for model in self.models]
                 average_prediction = np.mean(predictions, axis=0)
